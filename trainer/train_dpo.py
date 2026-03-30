@@ -20,11 +20,25 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
+# dpo讲解：
+#
+
+
+
 
 def logits_to_log_probs(logits, labels):
+    """
+    将模型的logits输出转换为对数概率
+    参数:
+        logits: 模型输出，形状为 (batch_size, seq_len, vocab_size)
+        labels: 真实标签，形状为 (batch_size, seq_len)
+    返回:
+        log_probs_per_token: 每个token的对数概率，形状为 (batch_size, seq_len)
+    """
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
+    # 在最后一个维度（词表维度）上应用log_softmax，得到每个位置的对数概率
     log_probs = F.log_softmax(logits, dim=2)
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return log_probs_per_token

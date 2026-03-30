@@ -1,6 +1,6 @@
 import os
 import sys
-
+#方便trainer_utils等模块导入
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -13,6 +13,9 @@ from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+
+
+#因为前面已经添加了搜索路径，这里可以i直接导入model和dataset模块
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
 from model.model_lora import save_lora, apply_lora
@@ -37,13 +40,18 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss).backward()#反向传播
 
         if step % args.accumulation_steps == 0:
+            # 对优化器进行梯度反缩放，用于梯度裁剪
             scaler.unscale_(optimizer)
+            # 对LoRA参数进行梯度裁剪，防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
+            # 更新参数
             scaler.step(optimizer)
+            # 更新梯度缩放器
             scaler.update()
+            # 清空梯度，set_to_none=True更高效
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters:
@@ -65,7 +73,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             model.train()
 
         del input_ids, labels, res, loss
-
+# 处理epoch结束时可能未完成的梯度累积步骤
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
@@ -84,6 +92,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
+    #让梯度裁剪，梯度过大会导致训练不稳定，甚至出现NaN。通过设置合理的梯度裁剪阈值，可以防止梯度爆炸，提高训练的稳定性和收敛性。
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
