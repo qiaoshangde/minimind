@@ -49,26 +49,39 @@ class CriticModel(MiniMindForCausalLM):
 
 
 def calculate_rewards(prompts, responses, reward_model):
+
+    """
+    计算每个回答的总奖励
+    奖励 = 规则奖励 + 模型奖励
+    """
     rewards = torch.zeros(len(responses), device=args.device)
 
     with torch.no_grad():
         reward_model_scores = []
         for i, (prompt, response) in enumerate(zip(prompts, responses)):
+            # 1. 解析prompt中的对话结构
+            # 提取所有 <|im_start|>role content<|im_end|> 模式
             pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
             matches = re.findall(pattern, prompt, re.DOTALL)
             messages = [{"role": role, "content": content.strip()} for role, content in matches]
             answer = response
+            # 2. 长度奖励：20-800字符得0.5分，否则扣0.5分
             rewards[i] += 0.5 if 20 <= len(response.strip()) <= 800 else -0.5
+            # 3. 思考标签奖励（如果模型使用think标签）
             if '</think>' in response:
+                # 分离思考内容和回答内容
                 thinking_content, answer_content = response.split('</think>', 1)
+                # 思考长度奖励：20-300字符得1分，否则扣0.5分
                 rewards[i] += 1.0 if 20 <= len(thinking_content.strip()) <= 300 else -0.5
-                rewards[i] += 0.25 if response.count('</think>') == 1 else -0.25
+                # 思考标签数量奖励：只有一个</think>得0.25分，否则扣0.25分
+                rewards[i] += 0.25 if response.count('<tool_call>') == 1 else -0.25
                 answer = answer_content.strip()
+            # 4. 重复惩罚（基于n-gram）
             rewards[i] -= rep_penalty(answer)
-
+            # 5. 奖励模型打分
             score = reward_model.get_score(messages, answer)
             reward_model_scores.append(score)
-
+        # 将奖励模型分数转换为tensor并加到总奖励中
         reward_model_scores = torch.tensor(reward_model_scores, device=args.device)
         rewards += reward_model_scores
 
@@ -85,16 +98,16 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=args.max_seq_len,
                         padding_side="left").to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
         prompt_length = enc.input_ids.shape[1]
-
+        # 使用rollout引擎生成回答
         rollout_result = rollout_engine.rollout(
-            prompt_ids=enc.input_ids,
-            attention_mask=enc.attention_mask,
-            num_generations=1,
-            max_new_tokens=args.max_gen_len,
-            temperature=0.8,
+            prompt_ids=enc.input_ids,# [B, P]
+            attention_mask=enc.attention_mask,# [B, P]
+            num_generations=1,# 每个prompt生成1个回答
+            max_new_tokens=args.max_gen_len, # 最大生成长度
+            temperature=0.8,# 采样温度
         )
-        gen_out = rollout_result.output_ids
-        responses_text = rollout_result.completions
+        gen_out = rollout_result.output_ids# [B, P+R] 生成的所有token
+        responses_text = rollout_result.completions# 生成的文本
         rewards = calculate_rewards(prompts, responses_text, reward_model)  # [B]
 
         if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
@@ -112,21 +125,35 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
                 Logger('='*100)
 
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
+        # 构建标签（用于计算log概率）
         labels = gen_out[:, 1:].clone()  # [B, P+R-1]
+        # 识别回答开始位置
         seq_len, resp_start = gen_out.size(1) - 1, prompt_length - 1
+
+
+        # 回答区域掩码
         resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= resp_start
         final_mask = (resp_mask & (~labels.eq(tokenizer.pad_token_id))).float()  # [B, P+R-1]
+
+
+
         B = len(prompts)
-        resp_labels = labels[:, resp_start:]  # [B, R]
+        resp_labels = labels[:, resp_start:]  # [B, R]  只保留回答部分
         resp_idx = torch.arange(resp_labels.size(1), device=gen_out.device).unsqueeze(0)
+         # 标记非padding位置
         resp_pad_mask = ~resp_labels.eq(tokenizer.pad_token_id)
+
+       
+        # 计算每个回答的实际长度（遇到EOS就停止）
         resp_lengths = resp_pad_mask.sum(dim=1); eos_mask = resp_labels.eq(tokenizer.eos_token_id) & resp_pad_mask
         has_eos = eos_mask.any(dim=1); eos_pos = torch.argmax(eos_mask.int(), dim=1)
         resp_lengths = torch.where(has_eos, eos_pos + 1, resp_lengths).long().clamp(min=1)
+        # 构建最终掩码（只计算有效token）
         resp_policy_mask = ((resp_idx < resp_lengths.unsqueeze(1)) & resp_pad_mask).float()
         resp_value_mask = resp_policy_mask.clone()
 
         with torch.no_grad():  # Rollout阶段只需推理获取old_logp和old_values，切断梯度省显存
+            #计算旧策略的log概率和价值
             critic_for_rollout = critic_model.module if isinstance(critic_model, DistributedDataParallel) else critic_model
             values_seq = critic_for_rollout(input_ids=gen_out, attention_mask=full_mask)
             old_resp_values = values_seq[:, resp_start:-1] * resp_value_mask
@@ -139,6 +166,13 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
             
             ref_logp_all = F.log_softmax(ref_model(input_ids=gen_out, attention_mask=full_mask).logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)
             ref_resp_logp = ref_logp_all[:, resp_start:]
+
+
+
+
+
+
+            #GAE优势函数计算
             token_rewards = torch.zeros_like(old_resp_logp)
             last_idx = resp_lengths - 1  # [B]
             token_rewards[torch.arange(B, device=args.device), last_idx] += rewards  # 末尾加外部奖励
@@ -155,7 +189,10 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
             adv_mean = (advantages * resp_policy_mask).sum() / resp_policy_mask.sum().clamp(min=1)
             adv_var = ((advantages - adv_mean) ** 2 * resp_policy_mask).sum() / resp_policy_mask.sum().clamp(min=1)
             advantages = (advantages - adv_mean) * torch.rsqrt(adv_var + 1e-8) * resp_policy_mask
-
+        
+        
+        
+        #PPO更新循环
         mb_size = max(1, min(args.mini_batch_size, B))
         stop_ppo = False
         policy_loss_sum = 0.0
@@ -188,13 +225,18 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
                 approx_kl = (0.5 * (log_ratio ** 2) * resp_policy_mask[inds]).sum() / resp_policy_mask[inds].sum().clamp(min=1)
                 
                 # 同步各卡的 approx_kl，防止某卡 break 而其它卡继续导致 DDP 死锁
+                ## 同步KL值，防止死锁
                 approx_kl_val = approx_kl.detach().clone()
                 if dist.is_initialized():
                     dist.all_reduce(approx_kl_val, op=dist.ReduceOp.AVG)
-                    
+                 # KL过大则早停    
                 if approx_kl_val > args.early_stop_kl:
                     stop_ppo = True
                 
+
+
+
+                #PPO损失函数计算
                 ratio = torch.exp(log_ratio)
                 clipfrac = ((((ratio - 1.0).abs() > args.clip_epsilon).float() * resp_policy_mask[inds]).sum()
                             / resp_policy_mask[inds].sum().clamp(min=1))
